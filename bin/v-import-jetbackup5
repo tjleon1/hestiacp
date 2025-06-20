@@ -1,0 +1,1003 @@
+#!/bin/bash
+
+# Script Name: v-import-jetbackup5
+# Description: Imports user accounts from JetBackup 5 backups.
+# Author: HestiaCP Team
+# Release: todo
+# Version: todo
+#
+# DO NOT MODIFY THIS FILE MANUALLY. IT IS MANAGED BY AUTOMATION.
+# To make changes, please modify the original source if available,
+# or use the provided tools/scripts for regeneration.
+#
+# For development purposes, you might temporarily comment out the above
+# warning to avoid accidental overwrites during manual testing,
+# but ensure it's reinstated before committing any changes.
+# It's crucial to maintain this header to prevent disruptions by automated processes.
+# Copyright (c) 2020-2024 HestiaCP
+# License: GPLv3
+
+
+# --- Global Variables & Configuration ---
+SCRIPT_NAME=$(basename "$0")
+TAG="[$SCRIPT_NAME]"
+
+# Function to display usage information
+usage() {
+    echo "Usage: $SCRIPT_NAME <jetbackup5_archive_path> [--replace-mx]"
+    echo "  <jetbackup5_archive_path>: Path to the JetBackup 5 tar.gz file."
+    echo "  --replace-mx             : Optional. Replace MX records during import (yes/no). Default: no."
+    exit 1
+}
+
+# Source HestiaCP main functions and configuration
+if [ -z "$HESTIA" ]; then
+    HESTIA="/usr/local/hestia"
+fi
+source $HESTIA/func/main.sh
+source $HESTIA/conf/hestia.conf
+
+# --- Argument Parsing ---
+if [ -z "$1" ]; then
+    usage
+fi
+
+JETBACKUP5_ARCHIVE_PATH="$1"
+REPLACE_MX_INPUT="${2#--replace-mx=}" # Capture potential value like --replace-mx=yes
+
+if [ "$2" == "--replace-mx" ]; then # Flag is present without an explicit value
+    REPLACE_MX="yes"
+elif [ -n "$REPLACE_MX_INPUT" ]; then # Flag has a value e.g. --replace-mx=yes or --replace-mx=no
+    if [ "$REPLACE_MX_INPUT" == "yes" ] || [ "$REPLACE_MX_INPUT" == "no" ]; then
+        REPLACE_MX="$REPLACE_MX_INPUT"
+    else
+        echo "Error: Invalid value for --replace-mx. Must be 'yes' or 'no'."
+        usage
+    fi
+else
+    REPLACE_MX="no" # Default if the flag is not present at all
+fi
+
+
+# --- Initial Checks ---
+# Check if rsync is installed
+if ! command -v rsync &> /dev/null; then
+    echo "$TAG Error: rsync is not installed. Please install it and try again."
+    exit 1
+fi
+
+# Check if file is installed
+if ! command -v file &> /dev/null; then
+    echo "$TAG Error: file is not installed. Please install it and try again."
+    exit 1
+fi
+
+# Check if jq is installed (useful for JSON parsing)
+if ! command -v jq &> /dev/null; then
+    echo "$TAG Warning: jq is not installed. JSON parsing will rely on grep/sed and might be less robust. Consider installing jq."
+fi
+
+# Check if backup file exists
+if [ ! -f "$JETBACKUP5_ARCHIVE_PATH" ]; then
+    echo "$TAG Error: Backup file '$JETBACKUP5_ARCHIVE_PATH' not found."
+    exit 1
+fi
+
+# --- Extract Account Name from Archive Filename ---
+archive_filename=$(basename "$JETBACKUP5_ARCHIVE_PATH")
+if [[ "$archive_filename" == download_*.tar.gz ]]; then
+    # download_{ACCOUNT_NAME}_timestamp_id.tar.gz
+    account_name_from_file=$(echo "$archive_filename" | sed -E 's/^download_([^_]+)_.*/\1/')
+elif [[ "$archive_filename" == *.tar.gz ]]; then
+    # {ACCOUNT_NAME}.tar.gz
+    account_name_from_file=$(echo "$archive_filename" | sed -E 's/\.tar\.gz$//')
+else
+    echo "$TAG Error: Could not determine account name from archive filename: $archive_filename"
+    echo "$TAG Please ensure the archive is named like 'accountname.tar.gz' or 'download_accountname_timestamp.tar.gz'."
+    exit 1
+fi
+echo "$TAG Info: Deduced account name from filename: $account_name_from_file"
+
+
+echo "$TAG Starting JetBackup 5 import process..."
+echo "$TAG Backup file: $JETBACKUP5_ARCHIVE_PATH"
+echo "$TAG Replace MX: $REPLACE_MX"
+
+# --- Temporary Directory ---
+IMPORT_ID=$(date +%s%N)
+TMP_DIR="/tmp/v-import-jetbackup5-$IMPORT_ID"
+
+echo "$TAG Creating temporary directory: $TMP_DIR"
+mkdir -p "$TMP_DIR"
+if [ $? -ne 0 ]; then
+    echo "$TAG Error: Failed to create temporary directory $TMP_DIR."
+    exit 1
+fi
+# Trap to ensure cleanup
+trap 'echo "$TAG Cleaning up temporary directory $TMP_DIR"; rm -rf "$TMP_DIR"' EXIT
+
+
+# --- Extract Main Backup Archive ---
+echo "$TAG Extracting main backup archive: $JETBACKUP5_ARCHIVE_PATH to $TMP_DIR"
+if ! tar xzf "$JETBACKUP5_ARCHIVE_PATH" -C "$TMP_DIR"; then
+    echo "$TAG Error: Failed to extract backup archive. Check the file integrity and permissions."
+    exit 1
+fi
+echo "$TAG Main archive extracted."
+
+# Determine the name of the directory created by tar
+# Assuming tar extracts a single top-level directory
+cd "$TMP_DIR"
+extracted_dirs=(*)
+if [ ${#extracted_dirs[@]} -ne 1 ] || [ ! -d "${extracted_dirs[0]}" ]; then
+    echo "$TAG Error: Archive did not extract into a single top-level directory in $TMP_DIR."
+    ls -lA "$TMP_DIR" # List contents for debugging
+    exit 1
+fi
+extracted_archive_root_dir="${extracted_dirs[0]}"
+echo "$TAG Archive content extracted to: $TMP_DIR/$extracted_archive_root_dir"
+
+# --- Navigate into JetBackup's 'backup' Directory ---
+JETBACKUP_DATA_DIR="$TMP_DIR/$extracted_archive_root_dir/backup"
+if [ ! -d "$JETBACKUP_DATA_DIR" ]; then
+    echo "$TAG Error: Expected directory '$JETBACKUP_DATA_DIR' not found after extraction."
+    echo "$TAG Contents of $TMP_DIR/$extracted_archive_root_dir:"
+    ls -lA "$TMP_DIR/$extracted_archive_root_dir"
+    exit 1
+fi
+
+cd "$JETBACKUP_DATA_DIR"
+if [ $? -ne 0 ]; then
+    echo "$TAG Error: Failed to navigate into $JETBACKUP_DATA_DIR."
+    exit 1
+fi
+echo "$TAG Changed directory to $(pwd)"
+
+# --- Basic Validation ---
+if [ ! -d "config" ]; then
+    echo "$TAG Error: Missing 'config' directory in $JETBACKUP_DATA_DIR."
+    exit 1
+fi
+
+if [ ! -d "homedir" ]; then
+    echo "$TAG Error: Missing 'homedir' directory in $JETBACKUP_DATA_DIR."
+    exit 1
+fi
+echo "$TAG Basic archive structure validated."
+
+# --- Parse Account Configuration ---
+CONFIG_FILE_PATH="config/account_configs/$account_name_from_file.json"
+echo "$TAG Attempting to parse account config: $CONFIG_FILE_PATH"
+
+if [ ! -f "$CONFIG_FILE_PATH" ]; then
+    echo "$TAG Error: Account configuration file '$CONFIG_FILE_PATH' not found."
+    # Try to find any .json file in account_configs if the derived one is not found
+    alternative_configs=(config/account_configs/*.json)
+    if [ ${#alternative_configs[@]} -eq 1 ] && [ -f "${alternative_configs[0]}" ]; then
+        echo "$TAG Info: Found alternative config file: ${alternative_configs[0]}"
+        CONFIG_FILE_PATH="${alternative_configs[0]}"
+        # Update account_name_from_file if we use an alternative config name
+        account_name_from_file=$(basename "${alternative_configs[0]}" .json)
+        echo "$TAG Info: Using account name from alternative config: $account_name_from_file"
+    else
+        echo "$TAG Error: Could not find a suitable account config JSON file in config/account_configs/."
+        exit 1
+    fi
+fi
+
+# Function to parse JSON using jq if available, otherwise grep/sed
+get_json_value() {
+    local file="$1"
+    local key="$2"
+    local value
+    if command -v jq &> /dev/null; then
+        value=$(jq -r ".$key // \"\"" "$file")
+    else
+        # Simplified parsing: looks for "key": "value"
+        value=$(grep -oP "\"$key\":\s*\"\K[^\"]*" "$file" | head -n 1)
+    fi
+    echo "$value"
+}
+
+new_user_hestia=$(get_json_value "$CONFIG_FILE_PATH" "username")
+main_domain=$(get_json_value "$CONFIG_FILE_PATH" "domain")
+email=$(get_json_value "$CONFIG_FILE_PATH" "email")
+cpanel_package_name=$(get_json_value "$CONFIG_FILE_PATH" "package") # JetBackup might use 'plan' or 'package'
+
+if [ -z "$new_user_hestia" ]; then
+    echo "$TAG Warning: Could not extract username from config. Using account name from filename: $account_name_from_file"
+    new_user_hestia="$account_name_from_file"
+else
+    echo "$TAG Info: Username from config: $new_user_hestia"
+fi
+
+if [ -z "$main_domain" ]; then
+    echo "$TAG Warning: Could not extract main domain from config."
+    # main_domain can remain empty, Hestia might handle this or we add it later
+fi
+echo "$TAG Info: Main domain from config: $main_domain"
+
+if [ -z "$email" ]; then
+    echo "$TAG Warning: Could not extract contact email from config."
+    email="generated@$main_domain" # Fallback email
+fi
+echo "$TAG Info: Contact email from config: $email"
+
+if [ -z "$cpanel_package_name" ]; then
+    echo "$TAG Info: Could not extract package/plan name from config. Will use 'default' Hestia package."
+    cpanel_package_name="default"
+fi
+echo "$TAG Info: Package/Plan from config: $cpanel_package_name"
+
+
+# --- System User Creation ---
+echo "$TAG Proceeding with Hestia user creation for: $new_user_hestia"
+
+# Check if user already exists
+if $HESTIA/bin/v-check-user-exists "$new_user_hestia" &>/dev/null; then
+    echo "$TAG Error: Hestia user '$new_user_hestia' already exists. Aborting."
+    exit 1
+fi
+
+# Determine Hestia package
+hestia_package="default"
+if [ "$cpanel_package_name" != "default" ]; then
+    if $HESTIA/bin/v-list-user-package "$cpanel_package_name" &>/dev/null; then
+        hestia_package="$cpanel_package_name"
+        echo "$TAG Info: Hestia package '$hestia_package' found and will be used."
+    else
+        echo "$TAG Warning: cPanel package '$cpanel_package_name' not found in Hestia. Using 'default' package."
+    fi
+else
+    echo "$TAG Info: Using 'default' Hestia package."
+fi
+
+# Generate temporary password
+tmp_passwd=$(openssl rand -base64 12)
+if [ -z "$tmp_passwd" ]; then # Fallback if openssl fails
+    tmp_passwd=$(date +%s%N | sha256sum | base64 | head -c 12)
+fi
+
+echo "$TAG Creating Hestia user: $new_user_hestia, Email: $email, Package: $hestia_package"
+# v-add-user USER PASS EMAIL [PKG] [FNAME] [LNAME] [MOBILE] [SHELL]
+# Using empty strings for FNAME, LNAME, MOBILE and 'no' for shell as a default
+if $HESTIA/bin/v-add-user "$new_user_hestia" "$tmp_passwd" "$email" "$hestia_package" "" "" "" "no"; then
+    echo "$TAG Info: Hestia user '$new_user_hestia' created successfully."
+else
+    echo "$TAG Error: Failed to create Hestia user '$new_user_hestia'."
+    exit 1
+fi
+
+# TODO: Password restoration for the main user is deferred.
+# User's original password hash might be in backup/config/auth/passwd or a similar file.
+
+# --- Domain and Website File Restoration ---
+echo "$TAG Starting domain and website file restoration for user $new_user_hestia"
+
+# Attempt to locate domain metadata
+# Common locations: config/domains_data.json, config/httpd_data.json, or within account_configs/USER.json
+DOMAINS_DATA_FILE=""
+if [ -f "config/domains_data.json" ]; then
+    DOMAINS_DATA_FILE="config/domains_data.json"
+    echo "$TAG Info: Found domain data in config/domains_data.json"
+elif [ -f "config/httpd_data.json" ]; then
+    # This file might be more complex, adjust parsing as needed
+    DOMAINS_DATA_FILE="config/httpd_data.json"
+    echo "$TAG Info: Found domain data in config/httpd_data.json (parsing might be limited)"
+else
+    echo "$TAG Warning: Neither config/domains_data.json nor config/httpd_data.json found. Domain import might be incomplete."
+    # As a fallback, the main domain from account_configs is already processed if available.
+    # For now, we will only attempt to process the main_domain if these files are missing.
+fi
+
+# Process main_domain first, as it's often a special case (e.g. public_html)
+if [ -n "$main_domain" ]; then
+    echo "$TAG Processing main domain: $main_domain"
+
+    # Check if domain already exists for this user or another
+    if $HESTIA/bin/v-list-web-domain "$new_user_hestia" "$main_domain" "json" | grep -q "$main_domain"; then
+        echo "$TAG Info: Main domain '$main_domain' already exists for user '$new_user_hestia'. Skipping addition, will attempt to sync files."
+    elif $HESTIA/bin/v-check-domain-exists "$main_domain" "no" != "0"; then # Checks if domain exists globally
+         # v-check-domain-exists returns 0 if domain does not exist, 1 if web exists, 2 if dns exists, 3 if mail exists
+        echo "$TAG Error: Main domain '$main_domain' already exists on the server under a different user. Skipping."
+    else
+        if ! $HESTIA/bin/v-add-domain "$new_user_hestia" "$main_domain"; then
+            echo "$TAG Error: Failed to add main domain '$main_domain' for user '$new_user_hestia'."
+            # Continue to other domains if this one fails
+        else
+            echo "$TAG Info: Successfully added main domain '$main_domain' for user '$new_user_hestia'."
+        fi
+    fi
+
+    # Determine original document root for main_domain
+    # This is often 'public_html' but JetBackup metadata should confirm.
+    # For now, assuming 'public_html' for the main_domain if not specified otherwise in DOMAINS_DATA_FILE
+    original_main_doc_root="public_html" # Default assumption
+    if [ -n "$DOMAINS_DATA_FILE" ] && command -v jq &> /dev/null; then
+        # Try to get docroot for main_domain from JSON (simplified example)
+        # This jq query assumes a structure like: { "main_domain_name": { "docroot": "path" } } or an array
+        # Actual structure of domains_data.json needs to be known for accurate parsing.
+        # For this iteration, we'll stick to the default for main_domain or a very simple lookup.
+        # Example: jq -r '.[] | select(.domain=="'$main_domain'") | .docroot' "$DOMAINS_DATA_FILE"
+        # This is complex due to varied JSON structures. For now, we'll use the default.
+        echo "$TAG Info: Document root for main domain '$main_domain' assumed to be '$original_main_doc_root'. Manual check might be needed if custom."
+    fi
+
+    source_doc_path="$JETBACKUP_DATA_DIR/homedir/$original_main_doc_root"
+    hestia_web_root="/home/$new_user_hestia/web/$main_domain/public_html"
+
+    if [ -d "$source_doc_path" ]; then
+        echo "$TAG Syncing files for $main_domain from $source_doc_path to $hestia_web_root"
+        # Ensure Hestia web root exists (v-add-domain should create it)
+        mkdir -p "$hestia_web_root"
+
+        # Remove Hestia default files
+        rm -f "$hestia_web_root/index.html" "$hestia_web_root/robots.txt"
+
+        # Sync files
+        if rsync -acrlp --delete "$source_doc_path/" "$hestia_web_root/"; then
+            echo "$TAG Info: Successfully synced files for $main_domain."
+            # Ownership and permissions
+            # v-add-domain sets initial ownership. Rsync (as root) preserves source (root) ownership.
+            # Hestia standard: /home/user/web/domain (user:user), /home/user/web/domain/public_html (user:www-data)
+            chown "$new_user_hestia:$new_user_hestia" "/home/$new_user_hestia/web/$main_domain" # domain folder itself
+            chown -R "$new_user_hestia:www-data" "$hestia_web_root"
+            find "$hestia_web_root" -type d -exec chmod 755 {} \;
+            find "$hestia_web_root" -type f -exec chmod 644 {} \;
+            # public_html itself is often 751 or 755. Hestia default is 755 after v-add-domain.
+            # Let's ensure public_html is 755 as per Hestia's setup.
+            chmod 755 "$hestia_web_root"
+            echo "$TAG Info: Filesystem permissions updated for $main_domain."
+        else
+            echo "$TAG Error: Failed to sync files for $main_domain from $source_doc_path."
+        fi
+    else
+        echo "$TAG Warning: Source document root '$source_doc_path' not found for main domain '$main_domain'. Skipping file sync."
+    fi
+else
+    echo "$TAG Info: No main_domain variable set from account config. Skipping main domain processing directly here."
+fi
+
+
+# Processing other domains (addons, subdomains) from JSON data if available
+if [ -n "$DOMAINS_DATA_FILE" ] && command -v jq &> /dev/null; then
+    echo "$TAG Info: Processing domains from $DOMAINS_DATA_FILE using jq."
+    # This is a simplified jq query. JetBackup's domains_data.json structure needs to be known.
+    # Common structure: an object where keys are domains, or an array of domain objects.
+    # Example for an array of objects: jq -c '.[] | {domain: .domain, docroot: .docroot, type: .type, aliases: .aliases // []}' "$DOMAINS_DATA_FILE"
+    # Example for an object with domain names as keys: jq -c 'to_entries[] | .value + {domain: .key, aliases: .value.aliases // []}' "$DOMAINS_DATA_FILE"
+
+    # Let's assume a structure like: { "domain1.com": {"docroot": "domain1.com", ...}, "sub.domain1.com": {"docroot": "sub.domain1.com", ...} }
+    # Or an array: [ {"domain": "domain1.com", "docroot": "domain1.com"}, ... ]
+    # The following is a placeholder and needs to be adapted to the actual JSON structure.
+    # For now, this part will be more of a structural guide than fully functional without knowing the JSON schema.
+
+    jq -c 'if type == "array" then .[] else to_entries[] | .value + {domain: .key} end | select(.domain != null and .docroot != null)' "$DOMAINS_DATA_FILE" | while IFS= read -r domain_entry_json; do
+        domain_name=$(echo "$domain_entry_json" | jq -r '.domain')
+        original_doc_root=$(echo "$domain_entry_json" | jq -r '.docroot')
+        # Aliases: jq -r '.aliases | if type == "array" then join(",") else "" end'
+        aliases_raw=$(echo "$domain_entry_json" | jq -r '.aliases // ""')
+        aliases_comma_separated=""
+        if [ -n "$aliases_raw" ] && [ "$aliases_raw" != "null" ]; then
+             aliases_comma_separated=$(echo "$aliases_raw" | jq -r 'if type == "array" then join(",") else . end')
+        fi
+
+        # Skip if this is the main domain, as it's handled above (or should be)
+        if [ "$domain_name" == "$main_domain" ]; then
+            echo "$TAG Info: Main domain $domain_name already processed or will be handled by main domain logic. Skipping here."
+            continue
+        fi
+
+        echo "$TAG Processing domain from JSON: $domain_name (DocRoot: $original_doc_root, Aliases: $aliases_comma_separated)"
+
+        # Check if domain already exists
+        if $HESTIA/bin/v-list-web-domain "$new_user_hestia" "$domain_name" "json" | grep -q "$domain_name"; then
+            echo "$TAG Info: Domain '$domain_name' already exists for user '$new_user_hestia'. Skipping addition, will attempt to sync files."
+        elif $HESTIA/bin/v-check-domain-exists "$domain_name" "no" != "0"; then
+            echo "$TAG Error: Domain '$domain_name' already exists on the server under a different user. Skipping."
+            continue
+        else
+            if [ -n "$aliases_comma_separated" ]; then
+                echo "$TAG Info: Adding domain '$domain_name' with aliases '$aliases_comma_separated' for user '$new_user_hestia'."
+                if ! $HESTIA/bin/v-add-domain "$new_user_hestia" "$domain_name" "" "" "$aliases_comma_separated"; then
+                    echo "$TAG Error: Failed to add domain '$domain_name' with aliases for user '$new_user_hestia'."
+                    continue
+                fi
+            else
+                echo "$TAG Info: Adding domain '$domain_name' for user '$new_user_hestia'."
+                if ! $HESTIA/bin/v-add-domain "$new_user_hestia" "$domain_name"; then
+                    echo "$TAG Error: Failed to add domain '$domain_name' for user '$new_user_hestia'."
+                    continue
+                fi
+            fi
+            echo "$TAG Info: Successfully added domain '$domain_name'."
+        fi
+
+        source_doc_path="$JETBACKUP_DATA_DIR/homedir/$original_doc_root"
+        # Hestia might create web roots like domain.com/public_html or subdomain.domain.com/public_html
+        # For non-main domains, Hestia places files directly in /home/user/web/domain_or_subdomain/
+        # However, the standard is to use public_html inside that. v-add-domain creates this structure.
+        hestia_web_root="/home/$new_user_hestia/web/$domain_name/public_html"
+
+        if [ -d "$source_doc_path" ]; then
+            echo "$TAG Syncing files for $domain_name from $source_doc_path to $hestia_web_root"
+            mkdir -p "$hestia_web_root" # Ensure it exists
+            rm -f "$hestia_web_root/index.html" "$hestia_web_root/robots.txt" # Remove Hestia defaults
+
+            if rsync -acrlp --delete "$source_doc_path/" "$hestia_web_root/"; then
+                echo "$TAG Info: Successfully synced files for $domain_name."
+                chown "$new_user_hestia:$new_user_hestia" "/home/$new_user_hestia/web/$domain_name"
+                chown -R "$new_user_hestia:www-data" "$hestia_web_root"
+                find "$hestia_web_root" -type d -exec chmod 755 {} \;
+                find "$hestia_web_root" -type f -exec chmod 644 {} \;
+                chmod 755 "$hestia_web_root" # Ensure public_html itself is correctly permissioned
+                echo "$TAG Info: Filesystem permissions updated for $domain_name."
+            else
+                echo "$TAG Error: Failed to sync files for $domain_name from $source_doc_path."
+            fi
+        else
+            echo "$TAG Warning: Source document root '$source_doc_path' not found for domain '$domain_name'. Skipping file sync."
+        fi
+    done
+elif [ -n "$DOMAINS_DATA_FILE" ]; then
+    echo "$TAG Warning: jq is not installed. Cannot parse $DOMAINS_DATA_FILE for detailed domain/subdomain/alias information. Only the main domain (if defined) will be processed with default assumptions."
+    echo "$TAG Please install jq for comprehensive domain restoration: sudo apt-get install jq"
+fi
+
+# Placeholder for PHP version adjustments
+echo "$TAG Info: PHP version adjustments are not yet implemented. Domains will use Hestia's default PHP version."
+echo "$TAG Please manually check and adjust PHP versions for each domain if needed."
+
+# --- Database Restoration ---
+echo "$TAG Starting database restoration for user $new_user_hestia"
+DB_USER_CONFIG_DIR="$JETBACKUP_DATA_DIR/database_user"
+DB_DUMPS_DIR="$JETBACKUP_DATA_DIR/database"
+DATABASES_PROCESSED=0
+
+if [ ! -d "$DB_USER_CONFIG_DIR" ]; then
+    echo "$TAG Warning: Database user configuration directory '$DB_USER_CONFIG_DIR' not found. Skipping database restoration."
+else
+    echo "$TAG Info: Processing database user configurations from $DB_USER_CONFIG_DIR"
+    for user_config_file in "$DB_USER_CONFIG_DIR"/*.user; do
+        if [ ! -f "$user_config_file" ]; then
+            echo "$TAG Info: No .user files found in $DB_USER_CONFIG_DIR. Skipping database user processing."
+            break # No files matching pattern
+        fi
+
+        echo "$TAG Info: Processing database user file: $user_config_file"
+
+        # Parse .user file (assuming KEY=value format)
+        original_db_user=$(grep -i '^DBUSER=' "$user_config_file" | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+        original_db_name=$(grep -i '^DB=' "$user_config_file" | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+        db_password=$(grep -i '^PASSWORD=' "$user_config_file" | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+        # DBHOST is often 'localhost' in these backups, Hestia also uses 'localhost' by default for mysql
+
+        if [ -z "$original_db_user" ] || [ -z "$original_db_name" ] || [ -z "$db_password" ]; then
+            echo "$TAG Error: Could not parse required DBUSER, DB, or PASSWORD from $user_config_file. Skipping this entry."
+            continue
+        fi
+        echo "$TAG Info: Original DB: $original_db_name, Original User: $original_db_user"
+
+        # Construct Hestia-style names (prefix + sanitized suffix, max length considerations)
+        # Suffix max length: Hestia user (max 16) + _ + suffix (max 16 for DB, 16 for User) = total can be around 33. MySQL limits are often 64.
+        # Hestia's own v-add-database uses similar logic for suffix length.
+        db_name_suffix=$(echo "$original_db_name" | sed "s/^${account_name_from_file}_//i" | tr -cd '[:alnum:]_' | cut -c1-16)
+        if [ -z "$db_name_suffix" ]; then db_name_suffix=$(echo "$original_db_name" | tr -cd '[:alnum:]_' | cut -c1-16); fi
+        hestia_db_name="${new_user_hestia}_${db_name_suffix}"
+
+        db_user_suffix=$(echo "$original_db_user" | sed "s/^${account_name_from_file}_//i" | tr -cd '[:alnum:]_' | cut -c1-16)
+        if [ -z "$db_user_suffix" ]; then db_user_suffix=$(echo "$original_db_user" | tr -cd '[:alnum:]_' | cut -c1-16); fi
+        hestia_db_user="${new_user_hestia}_${db_user_suffix}"
+
+        echo "$TAG Info: Hestia DB Name: $hestia_db_name, Hestia DB User: $hestia_db_user"
+
+        # Create database and user in Hestia
+        # v-add-database USER DBNAME DBUSER DBPASS [DBTYPE] [DBHOST] [CHARSET]
+        if $HESTIA/bin/v-add-database "$new_user_hestia" "$hestia_db_name" "$hestia_db_user" "$db_password" "mysql" "localhost" "utf8mb4"; then
+            echo "$TAG Info: Successfully created database '$hestia_db_name' and user '$hestia_db_user'."
+            DATABASES_PROCESSED=$((DATABASES_PROCESSED + 1))
+
+            # Locate and import SQL dump
+            sql_dump_gz="$DB_DUMPS_DIR/$original_db_name.sql.gz"
+            sql_dump_tmp="$TMP_DIR/$original_db_name.sql"
+
+            if [ -f "$sql_dump_gz" ]; then
+                echo "$TAG Info: Found SQL dump: $sql_dump_gz"
+                if gunzip -c "$sql_dump_gz" > "$sql_dump_tmp"; then
+                    echo "$TAG Info: Decompressed SQL dump to $sql_dump_tmp"
+
+                    # Apply compatibility sed commands (similar to v-import-cpanel)
+                    # Ensure SET names is at the top
+                    sed -i '1iSET names utf8mb4;' "$sql_dump_tmp"
+                    sed -i "s/utf8mb4_0900_ai_ci/utf8mb4_unicode_ci/g" "$sql_dump_tmp"
+                    # Add other sed commands if known compatibility issues arise with JetBackup5 dumps
+
+                    echo "$TAG Info: Importing SQL dump into $hestia_db_name..."
+                    if mysql "$hestia_db_name" < "$sql_dump_tmp"; then
+                        echo "$TAG Info: Successfully imported SQL dump for $hestia_db_name."
+                    else
+                        echo "$TAG Error: Failed to import SQL dump for $hestia_db_name. Check $sql_dump_tmp for issues."
+                    fi
+                    rm -f "$sql_dump_tmp"
+                else
+                    echo "$TAG Error: Failed to decompress SQL dump $sql_dump_gz."
+                fi
+            else
+                echo "$TAG Warning: SQL dump file '$sql_dump_gz' not found for database '$original_db_name'."
+            fi
+        else
+            echo "$TAG Error: Failed to create database '$hestia_db_name' or user '$hestia_db_user'."
+        fi
+        echo "---" # Separator for clarity
+    done
+fi
+
+if [ "$DATABASES_PROCESSED" -gt 0 ]; then
+    echo "$TAG Info: $DATABASES_PROCESSED database(s) processed. Rebuilding database configuration for user $new_user_hestia."
+    if $HESTIA/bin/v-rebuild-databases "$new_user_hestia"; then
+        echo "$TAG Info: Successfully rebuilt database configuration for $new_user_hestia."
+    else
+        echo "$TAG Error: Failed to rebuild database configuration for $new_user_hestia."
+    fi
+else
+    echo "$TAG Info: No databases were processed for user $new_user_hestia. Skipping database rebuild."
+fi
+
+# --- Placeholder for DNS Zone Import ---
+# TODO: Logic to import DNS zones
+
+# --- Mail Restoration ---
+echo "$TAG Starting mail restoration for user $new_user_hestia"
+MAIL_SRC_DIR="$JETBACKUP_DATA_DIR/homedir/mail"
+MAIL_CONFIG_BASE_DIR="$JETBACKUP_DATA_DIR/config/email_configs" # Adjusted assumption
+MAIL_DOMAINS_PROCESSED=0
+
+if [ ! -d "$MAIL_SRC_DIR" ]; then
+    echo "$TAG Warning: Mail source directory '$MAIL_SRC_DIR' not found. Skipping mail restoration."
+else
+    echo "$TAG Info: Processing mail domains from $MAIL_SRC_DIR"
+    for mail_domain_path in "$MAIL_SRC_DIR"/*; do
+        if [ ! -d "$mail_domain_path" ]; then
+            continue # Skip non-directory items
+        fi
+        mail_domain_name=$(basename "$mail_domain_path")
+        echo "$TAG Processing mail domain: $mail_domain_name"
+
+        # Check if mail domain already exists for this user or another
+        # v-list-mail-domain USER DOMAIN (exit 0 if exists for user)
+        # v-check-mail-domain DOMAIN (exit 0 if domain does not exist globally as mail domain)
+        if $HESTIA/bin/v-list-mail-domain "$new_user_hestia" "$mail_domain_name" &>/dev/null; then
+            echo "$TAG Info: Mail domain '$mail_domain_name' already exists for user '$new_user_hestia'. Skipping addition."
+        elif ! $HESTIA/bin/v-check-mail-domain "$mail_domain_name" &>/dev/null; then
+             # Returns 1 (false in shell) if domain exists globally
+            echo "$TAG Error: Mail domain '$mail_domain_name' is already configured on this server (possibly for another user or system-wide). Skipping."
+            continue
+        else
+            if ! $HESTIA/bin/v-add-mail-domain "$new_user_hestia" "$mail_domain_name"; then
+                echo "$TAG Error: Failed to add mail domain '$mail_domain_name' for user '$new_user_hestia'. Skipping accounts for this domain."
+                continue
+            else
+                echo "$TAG Info: Successfully added mail domain '$mail_domain_name'."
+            fi
+        fi
+
+        MAIL_DOMAINS_PROCESSED=$((MAIL_DOMAINS_PROCESSED + 1))
+        ACCOUNTS_IN_DOMAIN_PROCESSED=0
+
+        for mail_account_path in "$mail_domain_path"/*; do
+            if [ ! -d "$mail_account_path" ]; then
+                continue # Skip non-directory items (like potential domain-wide sieve scripts if any)
+            fi
+            mail_account_user=$(basename "$mail_account_path")
+
+            # Skip Maildir specific directories if they are at this level (usually they are inside the user's dir)
+            if [[ "$mail_account_user" == "cur" || "$mail_account_user" == "new" || "$mail_account_user" == "tmp" || "$mail_account_user" == ".Archive" ]]; then
+                continue
+            fi
+
+            echo "$TAG Processing mail account: $mail_account_user@$mail_domain_name"
+
+            # Password Restoration
+            password_to_use=""
+            # Try to find password in JetBackup configs (path and format are assumptions)
+            # Example path: backup/config/email_configs/domain.com/user.json
+            mail_acc_config_file="$MAIL_CONFIG_BASE_DIR/$mail_domain_name/$mail_account_user.json" # Or just user without .json?
+
+            if [ -f "$mail_acc_config_file" ]; then
+                echo "$TAG Info: Found mail account config: $mail_acc_config_file"
+                # Assuming JSON with a "password" field that might be base64 encoded or plain
+                # Or it could be "hashed_password" if it's a direct cPanel hash
+                raw_pass_json=$(get_json_value "$mail_acc_config_file" "password") # using existing get_json_value
+                if [ -n "$raw_pass_json" ]; then
+                    # Attempt base64 decode. If it fails, use raw. If it's a hash, v-add-mail-account might handle it or fail.
+                    # For now, we assume if "password" field exists, it's either plain or base64 of plain.
+                    # JetBackup might store it differently, e.g. already hashed in cPanel format.
+                    # This part is highly speculative.
+                    if echo "$raw_pass_json" | base64 --decode &>/dev/null; then
+                        password_to_use=$(echo "$raw_pass_json" | base64 --decode)
+                        echo "$TAG Info: Decoded password from config for $mail_account_user@$mail_domain_name."
+                    else
+                        password_to_use="$raw_pass_json" # Use as is, might be plain or a hash Hestia understands
+                        echo "$TAG Info: Used raw password value from config for $mail_account_user@$mail_domain_name."
+                    fi
+                else
+                    # Try "hashed_password" or other keys if "password" not found or empty
+                    hashed_pass_json=$(get_json_value "$mail_acc_config_file" "hashed_password")
+                    if [ -n "$hashed_pass_json" ]; then
+                         password_to_use="$hashed_pass_json"
+                         echo "$TAG Info: Used hashed_password value from config for $mail_account_user@$mail_domain_name."
+                    fi
+                fi
+            fi
+
+            if [ -z "$password_to_use" ]; then
+                password_to_use=$(openssl rand -base64 12)
+                echo "$TAG Warning: Password not found or extracted for $mail_account_user@$mail_domain_name. Generated a new random password: $password_to_use"
+            fi
+
+            # Add mail account
+            # v-add-mail-account USER DOMAIN ACCOUNT PASSWORD [QUOTA] [RESTART]
+            if $HESTIA/bin/v-add-mail-account "$new_user_hestia" "$mail_domain_name" "$mail_account_user" "$password_to_use" "" "no"; then # no restart for each account
+                echo "$TAG Info: Successfully added mail account $mail_account_user@$mail_domain_name."
+                ACCOUNTS_IN_DOMAIN_PROCESSED=$((ACCOUNTS_IN_DOMAIN_PROCESSED + 1))
+
+                # Mailbox Sync
+                source_maildir="$mail_account_path" # This is $JETBACKUP_DATA_DIR/homedir/mail/$mail_domain_name/$mail_account_user
+                dest_maildir="/home/$new_user_hestia/mail/$mail_domain_name/$mail_account_user"
+
+                echo "$TAG Syncing Maildir for $mail_account_user@$mail_domain_name from $source_maildir to $dest_maildir"
+                if rsync -acrlp --delete "$source_maildir/" "$dest_maildir/"; then #trailing slashes are important
+                    echo "$TAG Info: Maildir sync successful for $mail_account_user@$mail_domain_name."
+
+                    # Decompress gzipped emails (example, may need refinement)
+                    # find "$dest_maildir" -type f -print0 | while IFS= read -r -d $'\0' file_path; do
+                    #    if file "$file_path" | grep -q "gzip compressed"; then
+                    #        echo "$TAG Decompressing gzipped email: $file_path"
+                    #        mv "$file_path" "${file_path}.gz" # Keep original for timestamp reference
+                    #        if gunzip "${file_path}.gz"; then
+                    #            touch -r "${file_path}.gz" "$file_path" # Restore timestamp
+                    #            rm -f "${file_path}.gz" # remove placeholder after successful gunzip and touch
+                    #        else
+                    #            echo "$TAG Error: Failed to decompress ${file_path}.gz. Restoring original."
+                    #            mv "${file_path}.gz" "$file_path" # Restore original if gunzip fails
+                    #        fi
+                    #    fi
+                    # done
+                    # Simpler gzip check:
+                    find "$dest_maildir" -type f -name '*.gz' -print0 | while IFS= read -r -d $'\0' file_path; do
+                        # This assumes files are explicitly named .gz. If not, the 'file' command is better.
+                        # For now, sticking to a simpler approach that might miss some cases.
+                        # A more robust solution would use `file` and handle temp files for `touch`.
+                        echo "$TAG Found gzipped file (by name): $file_path. Attempting decompression."
+                        # gunzip will remove .gz extension. Storing original name for potential touch later.
+                        original_name_for_touch="${file_path%.gz}"
+                        if gunzip "$file_path"; then
+                           echo "$TAG Decompressed $file_path to $original_name_for_touch"
+                           # touch -r on .gz file before it's gone is tricky.
+                           # For now, we lose original timestamp on decompression if it was gzipped.
+                        else
+                           echo "$TAG Error: Failed to decompress $file_path"
+                        fi
+                    done
+
+
+                    # Cleanup Dovecot index/cache files from destination
+                    echo "$TAG Cleaning Dovecot cache files for $mail_account_user@$mail_domain_name."
+                    find "$dest_maildir" -maxdepth 1 -type f \( -name 'dovecot.*' -o -name 'subscriptions' -o -name 'maildirsize' \) -delete
+
+                    # Set ownership (v-add-mail-account might do this, but rsync as root changes it)
+                    chown -R "$new_user_hestia:mail" "$dest_maildir"
+                    # Set permissions (Maildir standard: dirs 700, files 600)
+                    find "$dest_maildir" -type d -exec chmod 700 {} \;
+                    find "$dest_maildir" -type f -exec chmod 600 {} \;
+                    echo "$TAG Info: Ownership and permissions updated for $mail_account_user@$mail_domain_name maildir."
+                else
+                    echo "$TAG Error: Maildir sync failed for $mail_account_user@$mail_domain_name."
+                fi
+            else
+                echo "$TAG Error: Failed to add mail account $mail_account_user@$mail_domain_name."
+            fi
+            echo "---"
+        done # End mail account loop
+
+        if [ "$ACCOUNTS_IN_DOMAIN_PROCESSED" -gt 0 ]; then
+            echo "$TAG Rebuilding mail domain configuration for $mail_domain_name."
+            if $HESTIA/bin/v-rebuild-mail-domain "$new_user_hestia" "$mail_domain_name" "yes"; then
+                echo "$TAG Info: Successfully rebuilt mail domain $mail_domain_name."
+            else
+                echo "$TAG Error: Failed to rebuild mail domain $mail_domain_name."
+            fi
+        else
+            echo "$TAG Info: No mail accounts processed for domain $mail_domain_name. Skipping rebuild for this domain."
+        fi
+        echo "===" # Separator for mail domains
+    done # End mail domain loop
+fi
+
+if [ "$MAIL_DOMAINS_PROCESSED" -gt 0 ]; then
+    echo "$TAG Info: Mail restoration process completed for $MAIL_DOMAINS_PROCESSED domain(s)."
+    if [ "$REPLACE_MX" == "yes" ]; then
+        echo "$TAG Warning: --replace-mx was specified. However, automatic MX record adjustment is not yet fully implemented in this script. Please manually verify DNS records for restored mail domains or await further script enhancements."
+    fi
+else
+    echo "$TAG Info: No mail domains were processed."
+fi
+
+# --- Cron Job Restoration ---
+echo "$TAG Starting cron job restoration for user $new_user_hestia"
+CRON_JOBS_FOUND=0
+CRON_CONFIG_JSON_PATH1="$JETBACKUP_DATA_DIR/config/crons.json"
+CRON_CONFIG_JSON_PATH2="$JETBACKUP_DATA_DIR/config/cron_data.json"
+CRON_CONFIG_TEXT_PATH1="$JETBACKUP_DATA_DIR/cron/$account_name_from_file" # Using account_name_from_file
+CRON_CONFIG_TEXT_PATH2="$JETBACKUP_DATA_DIR/cron/$new_user_hestia"       # Using hestia user name
+CRON_CONFIG_TEXT_PATH3="$JETBACKUP_DATA_DIR/crons/crontab.txt"          # Generic name
+
+CRON_SOURCE_FILE=""
+CRON_FORMAT="" # "json" or "text"
+
+if [ -f "$CRON_CONFIG_JSON_PATH1" ]; then
+    CRON_SOURCE_FILE="$CRON_CONFIG_JSON_PATH1"
+    CRON_FORMAT="json"
+    echo "$TAG Info: Found potential cron data JSON file: $CRON_SOURCE_FILE"
+elif [ -f "$CRON_CONFIG_JSON_PATH2" ]; then
+    CRON_SOURCE_FILE="$CRON_CONFIG_JSON_PATH2"
+    CRON_FORMAT="json"
+    echo "$TAG Info: Found potential cron data JSON file: $CRON_SOURCE_FILE"
+elif [ -f "$CRON_CONFIG_TEXT_PATH1" ]; then
+    CRON_SOURCE_FILE="$CRON_CONFIG_TEXT_PATH1"
+    CRON_FORMAT="text"
+    echo "$TAG Info: Found potential cron data text file: $CRON_SOURCE_FILE"
+elif [ -f "$CRON_CONFIG_TEXT_PATH2" ]; then
+    CRON_SOURCE_FILE="$CRON_CONFIG_TEXT_PATH2"
+    CRON_FORMAT="text"
+    echo "$TAG Info: Found potential cron data text file: $CRON_SOURCE_FILE"
+elif [ -f "$CRON_CONFIG_TEXT_PATH3" ]; then
+    CRON_SOURCE_FILE="$CRON_CONFIG_TEXT_PATH3"
+    CRON_FORMAT="text"
+    echo "$TAG Info: Found potential cron data text file: $CRON_SOURCE_FILE"
+else
+    echo "$TAG Warning: No standard cron data file found in common JetBackup 5 locations."
+    echo "$TAG Searched paths:"
+    echo "$TAG   - $CRON_CONFIG_JSON_PATH1"
+    echo "$TAG   - $CRON_CONFIG_JSON_PATH2"
+    echo "$TAG   - $CRON_CONFIG_TEXT_PATH1"
+    echo "$TAG   - $CRON_CONFIG_TEXT_PATH2"
+    echo "$TAG   - $CRON_CONFIG_TEXT_PATH3"
+    echo "$TAG Cron jobs will need to be manually recreated if they existed."
+fi
+
+if [ -n "$CRON_SOURCE_FILE" ]; then
+    echo "$TAG Processing cron jobs from $CRON_SOURCE_FILE (format: $CRON_FORMAT)"
+
+    if [ "$CRON_FORMAT" == "json" ]; then
+        if command -v jq &> /dev/null; then
+            # Assuming JSON structure: array of objects with keys like minute, hour, day, month, weekday, command
+            # Example: [{"minute":"0","hour":"0","day":"*","month":"*","weekday":"*","command":"/bin/true"}]
+            # Adjust jq query based on actual JetBackup5 cron JSON structure
+            jq -c '.[]' "$CRON_SOURCE_FILE" | while IFS= read -r cron_entry_json; do
+                min=$(echo "$cron_entry_json" | jq -r '.minute // .min // "*"')
+                hour=$(echo "$cron_entry_json" | jq -r '.hour // "*"')
+                day=$(echo "$cron_entry_json" | jq -r '.day_of_month // .dom // .day // "*"') # common variations for day of month
+                month=$(echo "$cron_entry_json" | jq -r '.month // .mon // "*"')
+                dow=$(echo "$cron_entry_json" | jq -r '.day_of_week // .dow // .weekday // "*"') # common variations for day of week
+                cmd=$(echo "$cron_entry_json" | jq -r '.command // .cmd')
+
+                if [ -z "$cmd" ] || [ "$cmd" == "null" ]; then
+                    echo "$TAG Warning: Skipping cron job with empty command from JSON entry: $cron_entry_json"
+                    continue
+                fi
+
+                # Sanitize fields, replace null or empty with '*' for schedule components
+                min=${min:-'*'}
+                hour=${hour:-'*'}
+                day=${day:-'*'}
+                month=${month:-'*'}
+                dow=${dow:-'*'}
+
+                echo "$TAG Info: Adding cron job from JSON: $min $hour $day $month $dow $cmd"
+                if $HESTIA/bin/v-add-cron-job "$new_user_hestia" "$min" "$hour" "$day" "$month" "$dow" "$cmd"; then
+                    CRON_JOBS_FOUND=$((CRON_JOBS_FOUND + 1))
+                else
+                    echo "$TAG Error: Failed to add cron job: $min $hour $day $month $dow $cmd"
+                fi
+            done
+        else
+            echo "$TAG Warning: jq is not installed, cannot parse cron JSON file $CRON_SOURCE_FILE. Cron jobs need manual setup."
+        fi
+    elif [ "$CRON_FORMAT" == "text" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            # Skip comments and empty lines
+            if [[ "$line" =~ ^\s*# ]] || [[ -z "$line" ]]; then
+                continue
+            fi
+            # Skip environment variable settings common in crontabs
+            if [[ "$line" =~ ^\s*(SHELL|MAILTO|PATH|HOME)= ]]; then
+                echo "$TAG Info: Skipping crontab environment setting: $line"
+                continue
+            fi
+
+            # Parse the line (basic parsing, assumes well-formed cron lines)
+            # Example: 0 2 * * 0 /usr/bin/example_script.sh
+            # Fields: min hour day month dow command
+            read -r min hour day month dow cmd <<< "$line"
+
+            # Check if parsing yielded a command; if not, it might be a malformed line or just env var
+            if [ -z "$cmd" ]; then
+                echo "$TAG Warning: Skipping malformed or non-job crontab line: $line"
+                continue
+            fi
+
+            echo "$TAG Info: Adding cron job from text: $min $hour $day $month $dow $cmd"
+            if $HESTIA/bin/v-add-cron-job "$new_user_hestia" "$min" "$hour" "$day" "$month" "$dow" "$cmd"; then
+                CRON_JOBS_FOUND=$((CRON_JOBS_FOUND + 1))
+            else
+                echo "$TAG Error: Failed to add cron job: $min $hour $day $month $dow $cmd"
+            fi
+        done < "$CRON_SOURCE_FILE"
+    fi
+
+    if [ "$CRON_JOBS_FOUND" -gt 0 ]; then
+        echo "$TAG Info: Successfully restored $CRON_JOBS_FOUND cron job(s) for user $new_user_hestia."
+        echo "$TAG Important: Review cron job commands for correct paths and compatibility in the new environment."
+    else
+        echo "$TAG Info: No cron jobs were restored from $CRON_SOURCE_FILE."
+    fi
+else
+    # This message is now part of the initial check block
+    # echo "$TAG Warning: Cron data file not found. Cron jobs will need to be manually recreated."
+    : # Do nothing, already handled
+fi
+
+# --- FTP Account Restoration ---
+echo "$TAG Starting FTP account restoration for user $new_user_hestia"
+FTP_ACCTS_DIR="$JETBACKUP_DATA_DIR/ftp"
+FTP_ACCTS_PROCESSED=0
+FTP_ACCTS_ADDED=0
+
+if [ ! -d "$FTP_ACCTS_DIR" ]; then
+    echo "$TAG Warning: FTP accounts directory '$FTP_ACCTS_DIR' not found. Skipping FTP restoration."
+else
+    echo "$TAG Info: Processing FTP account configurations from $FTP_ACCTS_DIR"
+
+    # Get list of user's web domains in Hestia for mapping
+    hestia_user_domains_json=$($HESTIA/bin/v-list-web-domains "$new_user_hestia" "json")
+    if [ -z "$hestia_user_domains_json" ] || [ "$hestia_user_domains_json" == "{}" ]; then
+        echo "$TAG Info: User $new_user_hestia has no web domains in Hestia. FTP accounts cannot be mapped to web domains."
+    fi
+
+    for ftp_acct_file in "$FTP_ACCTS_DIR"/*.acct; do
+        if [ ! -f "$ftp_acct_file" ]; then
+            echo "$TAG Info: No .acct files found in $FTP_ACCTS_DIR. Skipping FTP account processing."
+            break
+        fi
+
+        FTP_ACCTS_PROCESSED=$((FTP_ACCTS_PROCESSED + 1))
+        echo "$TAG Info: Processing FTP account file: $ftp_acct_file"
+
+        # Parse .acct file (assuming key: value format)
+        # Using awk for more robust parsing of "key: value" lines
+        ftp_user_raw=$(awk -F': ' '/^user:/ {print $2; exit}' "$ftp_acct_file")
+        ftp_password=$(awk -F': ' '/^pass:/ {print $2; exit}' "$ftp_acct_file")
+        if [ -z "$ftp_password" ]; then # Try 'password:' as a fallback
+             ftp_password=$(awk -F': ' '/^password:/ {print $2; exit}' "$ftp_acct_file")
+        fi
+        ftp_orig_path_raw=$(awk -F': ' '/^path:/ {print $2; exit}' "$ftp_acct_file")
+
+        if [ -z "$ftp_user_raw" ] || [ -z "$ftp_password" ] || [ -z "$ftp_orig_path_raw" ]; then
+            echo "$TAG Error: Could not parse required user, pass/password, or path from $ftp_acct_file. Skipping this entry."
+            continue
+        fi
+
+        # Sanitize path: remove potential leading/trailing quotes and leading slash for comparison.
+        ftp_orig_path=$(echo "$ftp_orig_path_raw" | sed -e 's/^"//' -e 's/"$//' -e "s|^/||")
+
+        # Determine short FTP username (Hestia needs just the user part)
+        short_ftp_user=$(echo "$ftp_user_raw" | cut -d'@' -f1)
+
+        echo "$TAG Info: FTP Original User: $ftp_user_raw (Short: $short_ftp_user), Original Path: /$ftp_orig_path"
+
+        mapped_hestia_domain=""
+        hestia_relative_path=""
+
+        # Attempt to map path to a Hestia web domain
+        # Path format from JetBackup .acct is relative to user's REAL home (/home/user/)
+        # e.g., public_html/subdir OR sub.domain.com/public_html/subdir (cPanel style for addon docroots)
+        # OR just any_dir for accounts chrooted to a specific directory.
+
+        # Iterate through Hestia domains for the user
+        echo "$hestia_user_domains_json" | jq -r 'keys[]' | while IFS= read -r current_hestia_domain; do
+            # Skip if already mapped
+            [ -n "$mapped_hestia_domain" ] && continue
+
+            # Case 1: Path matches main_domain's public_html or a subdir within it
+            # $main_domain is the one set from account_configs earlier
+            if [ "$current_hestia_domain" == "$main_domain" ]; then
+                if [ "$ftp_orig_path" == "public_html" ]; then
+                    mapped_hestia_domain="$main_domain"
+                    hestia_relative_path="/"
+                elif [[ "$ftp_orig_path" == public_html/* ]]; then
+                    mapped_hestia_domain="$main_domain"
+                    hestia_relative_path="/$(echo "$ftp_orig_path" | sed 's|^public_html/||')"
+                fi
+            fi
+
+            # Case 2: Path matches an addon domain's structure (e.g. domain.com/public_html or domain.com/public_html/subdir)
+            # In cPanel, addon domain files are often physically at homedir/domain.com/
+            # JetBackup path might be "domain.com" or "domain.com/some_subdir" if it's not using public_html for addons
+            # Or, if docroot for addon was homedir/public_html/addondir, then path would be public_html/addondir
+
+            # This simplified logic assumes addon domain files are within a directory named after the domain in homedir.
+            # This is a common cPanel setup. $current_hestia_domain is the actual domain name.
+            if [ "$ftp_orig_path" == "$current_hestia_domain" ]; then # FTP path points to root of addon domain's dir
+                 mapped_hestia_domain="$current_hestia_domain"
+                 hestia_relative_path="/" # Access to public_html of this domain
+            elif [[ "$ftp_orig_path" == "$current_hestia_domain/"* ]]; then # FTP path points to a subdir inside addon domain's dir
+                 # If the path is "$current_hestia_domain/public_html"
+                 if [[ "$ftp_orig_path" == "$current_hestia_domain/public_html" ]]; then
+                    mapped_hestia_domain="$current_hestia_domain"
+                    hestia_relative_path="/"
+                 # If the path is "$current_hestia_domain/public_html/subdir"
+                 elif [[ "$ftp_orig_path" == "$current_hestia_domain/public_html/"* ]]; then
+                    mapped_hestia_domain="$current_hestia_domain"
+                    hestia_relative_path="/$(echo "$ftp_orig_path" | sed "s|^$current_hestia_domain/public_html/||")"
+                 else
+                    # Path is like "domain.com/other_dir" (not public_html).
+                    # Hestia's v-add-web-domain-ftp maps to subdirs of public_html.
+                    # This case is hard to map directly to v-add-web-domain-ftp.
+                    # We could choose to map it to the domain, with path being "/" and let user access everything under that domain's web root.
+                    # For now, we require it to be within a recognizable public_html for clarity.
+                    echo "$TAG Info: FTP path '$ftp_orig_path' for domain '$current_hestia_domain' is outside its public_html. Specific sub-folder mapping might be lost."
+                    # Tentatively map to domain's root if direct subdir of domain path
+                    mapped_hestia_domain="$current_hestia_domain"
+                    hestia_relative_path="/" # Default to root of public_html for this domain
+                 fi
+            fi
+        done # End of Hestia domains loop for mapping
+
+        if [ -n "$mapped_hestia_domain" ]; then
+            echo "$TAG Info: Mapped FTP path /$ftp_orig_path to Hestia domain '$mapped_hestia_domain', relative path '$hestia_relative_path'."
+            # v-add-web-domain-ftp USER DOMAIN FTP_USER FTP_PASS [PATH] [QUOTA]
+            if $HESTIA/bin/v-add-web-domain-ftp "$new_user_hestia" "$mapped_hestia_domain" "$short_ftp_user" "$ftp_password" "$hestia_relative_path"; then
+                echo "$TAG Info: Successfully added FTP account '$short_ftp_user' for domain '$mapped_hestia_domain'."
+                FTP_ACCTS_ADDED=$((FTP_ACCTS_ADDED + 1))
+            else
+                echo "$TAG Error: Failed to add FTP account '$short_ftp_user' for domain '$mapped_hestia_domain'."
+            fi
+        else
+            # Handle cases where path is just "/" (user's home) or not mappable to any specific web domain's public_html structure
+            if [ "$ftp_orig_path" == "" ] || [ "$ftp_orig_path" == "." ]; then # Original path was effectively /home/user/
+                 echo "$TAG Warning: FTP account '$short_ftp_user' points to the root user directory ('$ftp_orig_path_raw'). Hestia does not directly support creating FTP accounts for the main user home via v-add-web-domain-ftp. Manual creation might be needed if general home dir access is required."
+            else
+                 echo "$TAG Warning: Could not map FTP path '$ftp_orig_path_raw' for FTP user '$short_ftp_user' to a specific web domain's public_html structure in Hestia. Manual creation advised."
+            fi
+        fi
+        echo "---"
+    done
+fi
+
+if [ "$FTP_ACCTS_PROCESSED" -gt 0 ]; then
+    if [ "$FTP_ACCTS_ADDED" -gt 0 ]; then
+        echo "$TAG Info: Successfully added $FTP_ACCTS_ADDED out of $FTP_ACCTS_PROCESSED processed FTP account(s)."
+    else
+        echo "$TAG Info: Processed $FTP_ACCTS_PROCESSED FTP account(s), but none were successfully added/mapped to Hestia domains."
+    fi
+else
+    echo "$TAG Info: No FTP accounts found or processed."
+fi
+
+# --- Placeholder for Database Import ---
+# TODO: Logic to import databases
+
+# --- Placeholder for Cron Job Import ---
+# TODO: Logic to import cron jobs
+
+# --- Placeholder for SSL Certificate Import ---
+# TODO: Logic to import SSL certificates
+
+# --- Placeholder for Final Cleanup within Script (if any) ---
+# The main TMP_DIR cleanup is handled by the trap
+
+echo "JetBackup 5 import script structure created."
+echo "Further implementation is needed for actual import logic."
+
+exit 0
