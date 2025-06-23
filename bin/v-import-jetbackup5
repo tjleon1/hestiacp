@@ -905,7 +905,7 @@ else
         # Initialize variables that will be set by the loop's output
         mapped_hestia_domain=""
         hestia_relative_path=""
-        local found_mapping="" # To capture output from the command substitution
+        found_mapping="" # To capture output from the command substitution (SC2168 fix)
 
         # Path format from JetBackup .acct is relative to user's REAL home (/home/user/)
         # e.g., public_html/subdir OR sub.domain.com/public_html/subdir (cPanel style for addon docroots)
@@ -914,8 +914,8 @@ else
         # The loop to find mapping runs in a subshell due to command substitution feeding `read` or direct variable assignment.
         # It outputs "domain:path" if a match is found.
         found_mapping=$(echo "$hestia_user_domains_json" | jq -r 'keys[]' | while IFS= read -r current_hestia_domain; do
-            local temp_mapped_domain=""
-            local temp_relative_path=""
+            temp_mapped_domain=""  # SC2168 fix (was local, but this is a subshell context where non-local is fine)
+            temp_relative_path="" # SC2168 fix
 
             # Case 1: Path matches main_domain's public_html or a subdir within it
             if [ "$current_hestia_domain" == "$main_domain" ]; then
@@ -940,11 +940,19 @@ else
                         temp_relative_path="/"
                      elif [[ "$ftp_orig_path" == "$current_hestia_domain/public_html/"* ]]; then
                         temp_mapped_domain="$current_hestia_domain"
-                        temp_relative_path="/${ftp_orig_path#$current_hestia_domain/public_html/}"
+                        pattern_prefix_to_remove="$current_hestia_domain/public_html/" # SC2295 fix
+                        temp_relative_path="/${ftp_orig_path#$pattern_prefix_to_remove}" # SC2295 fix
                      else
-                        echo "$TAG Info: FTP path '$ftp_orig_path' for domain '$current_hestia_domain' is outside its public_html. Specific sub-folder mapping might be lost." >&2
+                        # Path is like "domain.com/other_dir" (not public_html).
+                        echo "$TAG Info: FTP path '$ftp_orig_path' for domain '$current_hestia_domain' is not within its public_html. Attempting to map as relative path." >&2
                         temp_mapped_domain="$current_hestia_domain"
-                        temp_relative_path="/"
+                        pattern_domain_prefix_to_remove="$current_hestia_domain/"
+                        path_after_domain_strip="${ftp_orig_path#$pattern_domain_prefix_to_remove}"
+                        if [ "$path_after_domain_strip" != "$ftp_orig_path" ] && [ -n "$path_after_domain_strip" ]; then
+                           temp_relative_path="/$path_after_domain_strip"
+                        else # Default to root if stripping failed, path was just "domain.com", or resulted in empty path
+                           temp_relative_path="/"
+                        fi
                      fi
                 fi
             fi
@@ -957,10 +965,8 @@ else
 
         # Parse the output from the subshell
         if [ -n "$found_mapping" ]; then
-            mapped_hestia_domain=$(echo "$found_mapping" | cut -d':' -f1)
-            # Ensure to handle paths that might contain colons, though unlikely for typical relative paths.
-            # For safety, use a method that gets everything after the first colon.
-            hestia_relative_path=$(echo "$found_mapping" | sed 's/^[^:]*://')
+            mapped_hestia_domain="${found_mapping%%:*}" # Get part before first colon
+            hestia_relative_path="${found_mapping#*:}"  # Get part after first colon (SC2001 fix for sed)
         fi
 
         # Now, use the values set from the subshell's output
